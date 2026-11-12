@@ -515,17 +515,38 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 		     reinterpret_cast<uint64_t>(p->prog_bar_param),
 		     reinterpret_cast<uint64_t>(p->user_data));
 
-		const auto* items = static_cast<const SaveDataDialogItems*>(p->items);
-		if (items != nullptr && items->dir_names != nullptr) {
-			for (uint32_t i = 0; i < items->dir_names_num; i++) {
-				const auto* name = items->dir_names[i].data;
-				if (name[0] != '\0') {
-					std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s", name);
-					break;
-				}
-			}
-		}
-	}
+		
+const auto* items = static_cast<const SaveDataDialogItems*>(p->items);
+
+if (items != nullptr) {
+    LOGF("\t save user_id   = %d\n", items->user_id);
+    LOGF("\t save dir count = %u\n", items->dir_names_num);
+
+    if (items->dir_names != nullptr) {
+        constexpr uint32_t kMaxLoggedDirs = 64;
+        const uint32_t count =
+            items->dir_names_num < kMaxLoggedDirs
+                ? items->dir_names_num
+                : kMaxLoggedDirs;
+
+        for (uint32_t i = 0; i < count; ++i) {
+            char name[33] {};
+            std::memcpy(name, items->dir_names[i].data, 32);
+            LOGF("\t save dir[%u] = %s\n", i, name);
+        }
+
+        // Preserve KytyPS5's existing selection behavior.
+        for (uint32_t i = 0; i < items->dir_names_num; ++i) {
+            const auto* name = items->dir_names[i].data;
+            if (name[0] != '\0') {
+                std::snprintf(g_save_dir_name,
+                              sizeof(g_save_dir_name),
+                              "%s", name);
+                break;
+            }
+        }
+    }
+}
 
 	g_save_status         = SAVE_STATUS_RUNNING;
 	g_save_running_polled = false;
