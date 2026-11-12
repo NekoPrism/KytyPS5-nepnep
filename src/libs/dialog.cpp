@@ -529,13 +529,14 @@ if (items != nullptr) {
                 ? items->dir_names_num
                 : kMaxLoggedDirs;
 
+        // Log up to 64 save-directory names.
         for (uint32_t i = 0; i < count; ++i) {
             char name[33] {};
             std::memcpy(name, items->dir_names[i].data, 32);
             LOGF("\t save dir[%u] = %s\n", i, name);
         }
 
-        // Preserve KytyPS5's existing selection behavior.
+        // Preserve KytyPS5's original selection behavior.
         for (uint32_t i = 0; i < items->dir_names_num; ++i) {
             const auto* name = items->dir_names[i].data;
             if (name[0] != '\0') {
@@ -548,10 +549,10 @@ if (items != nullptr) {
     }
 }
 
-	g_save_status         = SAVE_STATUS_RUNNING;
-	g_save_running_polled = false;
+g_save_status         = SAVE_STATUS_RUNNING;
+g_save_running_polled = false;
 
-	return OK;
+return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
