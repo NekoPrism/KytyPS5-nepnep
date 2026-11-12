@@ -548,6 +548,7 @@ if (items != nullptr) {
         }
     }
 }
+	}
 
 g_save_status         = SAVE_STATUS_RUNNING;
 g_save_running_polled = false;
