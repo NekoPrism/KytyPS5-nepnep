@@ -3,6 +3,8 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include <string>
+#include <vector>
 
 namespace Libs::Dialog {
 
@@ -39,6 +41,26 @@ int KYTY_SYSV_ABI SigninDialogGetResult(void* result);
 } // namespace SigninDialog
 
 namespace SaveDataDialog {
+
+struct HostSnapshot {
+    uint64_t generation = 0;
+    std::vector<std::string> directories;
+    int selected_index = 0;
+    bool saving = false;
+    std::string new_directory;
+};
+
+struct VisualState {
+    bool active = false;
+    uint64_t revision = 0;
+};
+
+bool GetHostSnapshot(HostSnapshot* snapshot);
+VisualState GetVisualState() noexcept;
+void SetVisibilityCallback(void (*callback)());
+bool HostSelect(uint64_t generation, int index);
+bool HostCreateNew(uint64_t generation);
+bool HostCancel(uint64_t generation);
 
 int KYTY_SYSV_ABI SaveDataDialogInitialize();
 int KYTY_SYSV_ABI SaveDataDialogGetStatus();

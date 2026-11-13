@@ -10,6 +10,11 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <chrono>
+#include <thread>
+#include <algorithm>
+#include <string>
+#include <vector>
 
 // NOLINTNEXTLINE(modernize-concat-nested-namespaces)
 namespace Libs::Dialog {
@@ -437,22 +442,110 @@ struct SaveDataDialogResult {
 	uint8_t  reserved[32];
 };
 
-static std::atomic<int> g_save_status         = SAVE_STATUS_NONE;
-static bool             g_save_running_polled = false;
-static int              g_save_mode           = 0;
-static void*            g_save_user_data      = nullptr;
-static char             g_save_dir_name[sizeof(SaveDataDirName::data)] {};
+static std::atomic<int> g_save_status = SAVE_STATUS_NONE;
+static std::mutex g_save_mutex;
+static bool g_save_running_polled = false;
+static int g_save_mode = 0;
+static int g_save_disp_type = 0;
+static std::string g_save_new_directory;
+static void* g_save_user_data = nullptr;
+static char g_save_dir_name[sizeof(SaveDataDirName::data)] {};
+static std::vector<std::string> g_save_directories;
+static bool g_save_selection_active = false;
+static bool g_save_cancelled = false;
+static uint64_t g_save_generation = 0;
+static uint64_t g_save_revision = 0;
+static void (*g_save_visibility_callback)() = nullptr;
+
+bool GetHostSnapshot(HostSnapshot* snapshot) {
+    if (snapshot == nullptr) return false;
+    std::scoped_lock lock(g_save_mutex);
+    if (!g_save_selection_active || g_save_status != SAVE_STATUS_RUNNING) return false;
+    *snapshot = {g_save_generation, g_save_directories, 0,
+                 g_save_disp_type == 1, g_save_new_directory};
+    return true;
+}
+
+VisualState GetVisualState() noexcept {
+    std::scoped_lock lock(g_save_mutex);
+    return {g_save_selection_active && g_save_status == SAVE_STATUS_RUNNING, g_save_revision};
+}
+
+void SetVisibilityCallback(void (*callback)()) {
+    std::scoped_lock lock(g_save_mutex);
+    g_save_visibility_callback = callback;
+}
+
+bool HostSelect(uint64_t generation, int index) {
+    void (*callback)() = nullptr;
+    {
+        std::scoped_lock lock(g_save_mutex);
+        if (!g_save_selection_active || g_save_status != SAVE_STATUS_RUNNING ||
+            generation != g_save_generation || index < 0 ||
+            static_cast<size_t>(index) >= g_save_directories.size()) return false;
+        std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s",
+                      g_save_directories[static_cast<size_t>(index)].c_str());
+        g_save_cancelled = false;
+        g_save_selection_active = false;
+        g_save_status = SAVE_STATUS_FINISHED;
+        ++g_save_revision;
+        callback = g_save_visibility_callback;
+    }
+    if (callback) callback();
+    return true;
+}
+
+bool HostCreateNew(uint64_t generation) {
+    void (*callback)() = nullptr;
+    {
+        std::scoped_lock lock(g_save_mutex);
+        if (!g_save_selection_active || g_save_status != SAVE_STATUS_RUNNING ||
+            generation != g_save_generation || g_save_disp_type != 1 ||
+            g_save_new_directory.empty()) return false;
+        std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s",
+                      g_save_new_directory.c_str());
+        LOGF("\t [SAVE UI] Creating new slot: %s\n", g_save_dir_name);
+        g_save_cancelled = false;
+        g_save_selection_active = false;
+        g_save_status = SAVE_STATUS_FINISHED;
+        ++g_save_revision;
+        callback = g_save_visibility_callback;
+    }
+    if (callback) callback();
+    return true;
+}
+
+bool HostCancel(uint64_t generation) {
+    void (*callback)() = nullptr;
+    {
+        std::scoped_lock lock(g_save_mutex);
+        if (!g_save_selection_active || g_save_status != SAVE_STATUS_RUNNING ||
+            generation != g_save_generation) return false;
+        g_save_cancelled = true;
+        g_save_dir_name[0] = '\0';
+        g_save_selection_active = false;
+        g_save_status = SAVE_STATUS_FINISHED;
+        ++g_save_revision;
+        callback = g_save_visibility_callback;
+    }
+    if (callback) callback();
+    return true;
+}
 
 int KYTY_SYSV_ABI SaveDataDialogInitialize() {
-	PRINT_NAME();
-
-	g_save_status         = SAVE_STATUS_INITIALIZED;
-	g_save_running_polled = false;
-	g_save_mode           = 0;
-	g_save_user_data      = nullptr;
-	g_save_dir_name[0]    = '\0';
-
-	return OK;
+    PRINT_NAME();
+    std::scoped_lock lock(g_save_mutex);
+    g_save_status = SAVE_STATUS_INITIALIZED;
+    g_save_running_polled = false;
+    g_save_mode = 0;
+    g_save_disp_type = 0;
+    g_save_new_directory.clear();
+    g_save_user_data = nullptr;
+    g_save_dir_name[0] = '\0';
+    g_save_directories.clear();
+    g_save_selection_active = false;
+    g_save_cancelled = false;
+    return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
@@ -462,109 +555,168 @@ int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 }
 
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
-	PRINT_NAME();
-
-	// Some games require a RUNNING update before FINISHED.
-	if (g_save_status == SAVE_STATUS_RUNNING) {
-		if (g_save_running_polled) {
-			g_save_status = SAVE_STATUS_FINISHED;
-		}
-		g_save_running_polled = true;
-	}
-
-	return g_save_status;
+    PRINT_NAME();
+    std::scoped_lock lock(g_save_mutex);
+    const int old_status = g_save_status;
+    const bool was_polled = g_save_running_polled;
+    if (g_save_status == SAVE_STATUS_RUNNING && !g_save_selection_active) {
+        if (g_save_running_polled) g_save_status = SAVE_STATUS_FINISHED;
+        g_save_running_polled = true;
+    }
+    LOGF("\t [SAVE DEBUG] UpdateStatus: %d -> %d, previously_polled=%d\n",
+         old_status, g_save_status.load(), static_cast<int>(was_polled));
+    return g_save_status;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
-	PRINT_NAME();
+    PRINT_NAME();
 
-	if (result != nullptr) {
-		auto* r      = static_cast<SaveDataDialogResult*>(result);
-		r->mode      = g_save_mode;
-		r->result    = SAVE_RESULT_OK;
-		r->button_id = SAVE_BUTTON_ID_OK;
-		r->user_data = g_save_user_data;
-		if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
-			std::snprintf(static_cast<SaveDataDirName*>(r->dir_name)->data,
-			              sizeof(SaveDataDirName::data), "%s", g_save_dir_name);
-		}
-	}
+    std::scoped_lock lock(g_save_mutex);
 
-	return OK;
+    LOGF("\t [SAVE DEBUG] GetResult: result_ptr=%p, status=%d\n",
+     result, g_save_status.load());
+
+    if (result != nullptr) {
+        auto* r      = static_cast<SaveDataDialogResult*>(result);
+        r->mode      = g_save_mode;
+        r->result    = g_save_cancelled ? 1 : SAVE_RESULT_OK;
+        r->button_id = g_save_cancelled ? 0 : SAVE_BUTTON_ID_OK;
+        r->user_data = g_save_user_data;
+
+        if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
+            std::snprintf(static_cast<SaveDataDirName*>(r->dir_name)->data,
+                          sizeof(SaveDataDirName::data), "%s", g_save_dir_name);
+        }
+
+        // Verify the actual result buffer returned to the game.
+        LOGF("\t [SAVE DEBUG] Result buffer: dir_ptr=%p, param_ptr=%p, user_data=%p\n",
+             r->dir_name, r->param, r->user_data);
+
+        if (r->dir_name != nullptr) {
+            LOGF("\t [SAVE DEBUG] Result directory: %.32s\n",
+                 static_cast<SaveDataDirName*>(r->dir_name)->data);
+
+
+        if (r->param != nullptr) {
+            const auto* bytes =
+                static_cast<const unsigned char*>(r->param);
+
+            LOGF("\t [SAVE DEBUG] Result param first 16 bytes:"
+                 " %02x %02x %02x %02x %02x %02x %02x %02x"
+                 " %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 static_cast<unsigned>(bytes[0]),
+                 static_cast<unsigned>(bytes[1]),
+                 static_cast<unsigned>(bytes[2]),
+                 static_cast<unsigned>(bytes[3]),
+                 static_cast<unsigned>(bytes[4]),
+                 static_cast<unsigned>(bytes[5]),
+                 static_cast<unsigned>(bytes[6]),
+                 static_cast<unsigned>(bytes[7]),
+                 static_cast<unsigned>(bytes[8]),
+                 static_cast<unsigned>(bytes[9]),
+                 static_cast<unsigned>(bytes[10]),
+                 static_cast<unsigned>(bytes[11]),
+                 static_cast<unsigned>(bytes[12]),
+                 static_cast<unsigned>(bytes[13]),
+                 static_cast<unsigned>(bytes[14]),
+                 static_cast<unsigned>(bytes[15]));
+        }
+
+        }
+
+        LOGF("\t [SAVE DEBUG] GetResult: mode=%d, result=%d, button=%d, dir=%s\n",
+             r->mode, r->result, r->button_id, g_save_dir_name);
+    }
+
+    return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
-	PRINT_NAME();
-
-	const auto* p = static_cast<const SaveDataDialogParam*>(param);
-	if (p != nullptr) {
-		g_save_mode        = p->mode;
-		g_save_user_data   = p->user_data;
-		g_save_dir_name[0] = '\0';
-		LOGF("\t size           = %d\n"
-		     "\t mode           = %d\n"
-		     "\t disp_type      = %d\n"
-		     "\t items          = 0x%016" PRIx64 "\n"
-		     "\t user_msg_param = 0x%016" PRIx64 "\n"
-		     "\t sys_msg_param  = 0x%016" PRIx64 "\n"
-		     "\t prog_bar_param = 0x%016" PRIx64 "\n"
-		     "\t user_data      = 0x%016" PRIx64 "\n",
-		     p->size, p->mode, p->disp_type, reinterpret_cast<uint64_t>(p->items),
-		     reinterpret_cast<uint64_t>(p->user_msg_param),
-		     reinterpret_cast<uint64_t>(p->sys_msg_param),
-		     reinterpret_cast<uint64_t>(p->prog_bar_param),
-		     reinterpret_cast<uint64_t>(p->user_data));
-
-		
-const auto* items = static_cast<const SaveDataDialogItems*>(p->items);
-
-if (items != nullptr) {
-    LOGF("\t save user_id   = %d\n", items->user_id);
-    LOGF("\t save dir count = %u\n", items->dir_names_num);
-
-    if (items->dir_names != nullptr) {
-        constexpr uint32_t kMaxLoggedDirs = 64;
-        const uint32_t count =
-            items->dir_names_num < kMaxLoggedDirs
-                ? items->dir_names_num
-                : kMaxLoggedDirs;
-
-        // Log up to 64 save-directory names.
-        for (uint32_t i = 0; i < count; ++i) {
-            char name[33] {};
-            std::memcpy(name, items->dir_names[i].data, 32);
-            LOGF("\t save dir[%u] = %s\n", i, name);
+    PRINT_NAME();
+    const auto* p = static_cast<const SaveDataDialogParam*>(param);
+    std::vector<std::string> directories;
+    if (p != nullptr) {
+        LOGF("\t size=%d mode=%d disp_type=%d items=%p\n",
+             p->size, p->mode, p->disp_type, p->items);
+        const auto* items = static_cast<const SaveDataDialogItems*>(p->items);
+        if (items && items->dir_names) {
+            // Bound the number of guest entries copied into host-owned storage.
+            constexpr uint32_t MAX_DIRS = 1024;
+            const uint32_t count = std::min(items->dir_names_num, MAX_DIRS);
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto* raw = items->dir_names[i].data;
+                const size_t len = strnlen(raw, sizeof(SaveDataDirName::data));
+                if (len != 0) directories.emplace_back(raw, len);
+                LOGF("\t save dir[%u] = %.*s\n", i, static_cast<int>(len), raw);
+            }
         }
+    }
 
-        // Preserve KytyPS5's original selection behavior.
-        for (uint32_t i = 0; i < items->dir_names_num; ++i) {
-            const auto* name = items->dir_names[i].data;
-            if (name[0] != '\0') {
-                std::snprintf(g_save_dir_name,
-                              sizeof(g_save_dir_name),
-                              "%s", name);
+    // Experimental new-slot candidate: use the first unused SAVELIST#### name.
+    // Only existing names supplied by the game are considered; the host does
+    // not create a directory here. The game's subsequent save must do that.
+    std::string new_directory;
+    if (p != nullptr && p->mode == 1 && p->disp_type == 1) {
+        for (unsigned slot = 0; slot <= 9999; ++slot) {
+            char candidate[sizeof(SaveDataDirName::data)] {};
+            std::snprintf(candidate, sizeof(candidate), "SAVELIST%04u", slot);
+            if (std::find(directories.begin(), directories.end(), candidate) == directories.end()) {
+                new_directory = candidate;
                 break;
             }
         }
     }
-}
-	}
 
-g_save_status         = SAVE_STATUS_RUNNING;
-g_save_running_polled = false;
+    // Preserve the working-build experiment exactly for mode 5.
+    if (p != nullptr && p->mode == 5) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
-return OK;
+    void (*callback)() = nullptr;
+    {
+        std::scoped_lock lock(g_save_mutex);
+        g_save_mode = p ? p->mode : 0;
+        g_save_disp_type = p ? p->disp_type : 0;
+        g_save_new_directory = std::move(new_directory);
+        g_save_user_data = p ? p->user_data : nullptr;
+        g_save_dir_name[0] = '\0';
+        g_save_directories = std::move(directories);
+        g_save_cancelled = false;
+        g_save_running_polled = false;
+        if (!g_save_directories.empty()) {
+            std::snprintf(g_save_dir_name, sizeof(g_save_dir_name), "%s",
+                          g_save_directories.front().c_str());
+        }
+        // Only list mode with selectable entries uses the interactive overlay.
+        g_save_selection_active = (g_save_mode == 1 &&
+            (!g_save_directories.empty() || !g_save_new_directory.empty()));
+        g_save_status = SAVE_STATUS_RUNNING;
+        if (g_save_selection_active) {
+            ++g_save_generation;
+            ++g_save_revision;
+            callback = g_save_visibility_callback;
+        }
+    }
+    if (callback) callback();
+    return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
-	PRINT_NAME();
-
-	LOGF("\t close_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(close_param));
-
-	g_save_status         = SAVE_STATUS_FINISHED;
-	g_save_running_polled = false;
-
-	return OK;
+    PRINT_NAME();
+    LOGF("\t close_param = %p\n", close_param);
+    void (*callback)() = nullptr;
+    {
+        std::scoped_lock lock(g_save_mutex);
+        if (g_save_selection_active) {
+            g_save_selection_active = false;
+            ++g_save_revision;
+            callback = g_save_visibility_callback;
+        }
+        g_save_status = SAVE_STATUS_FINISHED;
+        g_save_running_polled = false;
+    }
+    if (callback) callback();
+    return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay() {
@@ -574,15 +726,27 @@ int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay() {
 }
 
 int KYTY_SYSV_ABI SaveDataDialogTerminate() {
-	PRINT_NAME();
-
-	g_save_status         = SAVE_STATUS_NONE;
-	g_save_running_polled = false;
-	g_save_mode           = 0;
-	g_save_user_data      = nullptr;
-	g_save_dir_name[0]    = '\0';
-
-	return 0;
+    PRINT_NAME();
+    void (*callback)() = nullptr;
+    {
+        std::scoped_lock lock(g_save_mutex);
+        if (g_save_selection_active) {
+            ++g_save_revision;
+            callback = g_save_visibility_callback;
+        }
+        g_save_status = SAVE_STATUS_NONE;
+        g_save_running_polled = false;
+        g_save_mode = 0;
+    g_save_disp_type = 0;
+    g_save_new_directory.clear();
+        g_save_user_data = nullptr;
+        g_save_dir_name[0] = '\0';
+        g_save_directories.clear();
+        g_save_selection_active = false;
+        g_save_cancelled = false;
+    }
+    if (callback) callback();
+    return OK;
 }
 
 int KYTY_SYSV_ABI SaveDataDialogProgressBarInc(int target, uint32_t delta) {

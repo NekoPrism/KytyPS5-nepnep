@@ -51,6 +51,7 @@ using Clock = std::chrono::steady_clock;
 namespace CoreIme      = Libs::Ime;
 namespace DialogIme    = Libs::Dialog::ImeDialog;
 namespace SystemDialog = Libs::Dialog::SystemDialog;
+namespace SaveDialog = Libs::Dialog::SaveDataDialog;
 
 namespace Ime {
 
@@ -123,7 +124,7 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Dialog };
+enum class OverlayKind : uint8_t { None, Ime, Dialog, SaveData };
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -136,9 +137,14 @@ struct OverlaySnapshot {
 	OverlaySession             session;
 	Ime::HostSnapshot          ime;
 	SystemDialog::HostSnapshot dialog;
+	SaveDialog::HostSnapshot save;
 };
 
 bool GetOverlaySnapshot(OverlaySnapshot* snapshot) {
+    if (SaveDialog::GetHostSnapshot(&snapshot->save)) {
+        snapshot->session = {OverlayKind::SaveData, snapshot->save.generation};
+        return true;
+    }
 	if (SystemDialog::GetHostSnapshot(&snapshot->dialog)) {
 		snapshot->session = {OverlayKind::Dialog, snapshot->dialog.generation};
 		return true;
@@ -392,7 +398,8 @@ void RefreshVisibility() {
 	bool capture_keyboard   = false;
 	bool text_input         = false;
 	bool multiline          = false;
-	if (snapshot.session.kind == OverlayKind::Dialog) {
+	if (snapshot.session.kind == OverlayKind::Dialog ||
+	    snapshot.session.kind == OverlayKind::SaveData) {
 		capture_controller = true;
 		capture_keyboard   = true;
 	} else if (snapshot.session.kind == OverlayKind::Ime) {
@@ -668,6 +675,7 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
 	SystemDialog::SetVisibilityCallback(RefreshVisibility);
+	SaveDialog::SetVisibilityCallback(RefreshVisibility);
 	RefreshVisibility();
 }
 
@@ -676,6 +684,7 @@ void ShutdownSystemOverlayInput() {
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
 	SystemDialog::SetVisibilityCallback(nullptr);
+	SaveDialog::SetVisibilityCallback(nullptr);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = false;
@@ -706,12 +715,13 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const auto core   = CoreIme::GetVisualState();
 	const auto dialog = DialogIme::GetVisualState();
 	const auto system = SystemDialog::GetVisualState();
+	const auto save = SaveDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
-	return {core.active || dialog.active || system.active || trophy_active || splash ||
+	return {core.active || dialog.active || system.active || save.active || trophy_active || splash ||
 	            cursor.enabled,
-	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
+	        core.revision + dialog.revision + system.revision + save.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
 	            PerformanceOverlayRevision()};
 }
@@ -766,7 +776,26 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
 	}
-	if (keyboard_event && session.kind == OverlayKind::Dialog) {
+	if (keyboard_event && session.kind == OverlayKind::SaveData) {
+        // Keyboard navigation is handled by ImGui via the input queue.
+        if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
+            const bool down = event.type == SDL_EVENT_KEY_DOWN;
+            ImGuiKey key = ImGuiKey_None;
+            switch (event.key.key) {
+                case SDLK_UP: key = ImGuiKey_UpArrow; break;
+                case SDLK_DOWN: key = ImGuiKey_DownArrow; break;
+                case SDLK_RETURN: case SDLK_KP_ENTER: key = ImGuiKey_Enter; break;
+                case SDLK_ESCAPE: key = ImGuiKey_Escape; break;
+                default: break;
+            }
+            if (key != ImGuiKey_None) {
+                QueueInput({InputKind::Button, session, -100 - static_cast<int>(key),
+                            down ? 1.0f : 0.0f, 0.0f});
+            }
+        }
+        return true;
+    }
+    if (keyboard_event && session.kind == OverlayKind::Dialog) {
 		if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
 		    (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER ||
 		     event.key.key == SDLK_ESCAPE)) {
@@ -866,6 +895,9 @@ struct SystemOverlay::Impl {
 		ImVec2            to;
 		Clock::time_point born;
 	};
+
+	uint64_t save_ui_generation = 0;
+	int save_ui_index = 0;
 
 	explicit Impl(GraphicContext& context): graphics(context) {}
 
@@ -1161,7 +1193,9 @@ struct SystemOverlay::Impl {
 							Ime::HostBackspace(session.generation);
 						}
 					}
-					const ImGuiKey key = ControllerButtonToKey(event.id);
+					const ImGuiKey key = event.id <= -100
+                        ? static_cast<ImGuiKey>(-100 - event.id)
+                        : ControllerButtonToKey(event.id);
 					if (key != ImGuiKey_None) {
 						io.AddKeyEvent(key, down);
 					}
@@ -1374,6 +1408,64 @@ struct SystemOverlay::Impl {
 		}
 		ImGui::End();
 	}
+
+    void DrawSaveData(const SaveDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
+        const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
+        const float scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
+        ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, display, IM_COL32(0, 0, 0, 160));
+        ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+        ImGui::SetNextWindowSize({std::min(620.0f * scale, display.x - 32.0f),
+                                  std::min(540.0f * scale, display.y - 32.0f)}, ImGuiCond_Always);
+        if (focus_pending) ImGui::SetNextWindowFocus();
+        constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                            ImGuiWindowFlags_NoSavedSettings;
+        ImGui::Begin("##SaveDataSelection", nullptr, flags);
+        ImGui::TextUnformatted(snapshot.saving ? "Select Save Destination" : "Select Save Data");
+        ImGui::Separator();
+        if (save_ui_generation != snapshot.generation) {
+            save_ui_generation = snapshot.generation;
+            save_ui_index = 0;
+        }
+        const int count = static_cast<int>(snapshot.directories.size());
+        const int choice_count = count + (snapshot.saving && !snapshot.new_directory.empty() ? 1 : 0);
+        if (choice_count > 0) {
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown))
+                save_ui_index = (save_ui_index + 1) % choice_count;
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp))
+                save_ui_index = (save_ui_index + choice_count - 1) % choice_count;
+        }
+        ImGui::BeginChild("##SaveList", {0.0f, -90.0f}, true);
+        if (snapshot.saving && !snapshot.new_directory.empty()) {
+            const std::string label = "Create New Save (" + snapshot.new_directory + ")";
+            if (ImGui::Selectable(label.c_str(), save_ui_index == count)) {
+                save_ui_index = count;
+                SaveDialog::HostCreateNew(snapshot.generation);
+            }
+        }
+        for (int i = 0; i < count; ++i) {
+            const bool selected = save_ui_index == i;
+            if (ImGui::Selectable(snapshot.directories[static_cast<size_t>(i)].c_str(), selected)) {
+                save_ui_index = i;
+                SaveDialog::HostSelect(snapshot.generation, i);
+            }
+            if (selected && focus_pending) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndChild();
+        const bool confirm = ImGui::Button(snapshot.saving ? "Save to selected slot" : "Load selected save") ||
+                             ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+                             ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown);
+        ImGui::SameLine();
+        const bool cancel = ImGui::Button("Cancel") ||
+                            ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+                            ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight);
+        if (confirm && save_ui_index == count && snapshot.saving && !snapshot.new_directory.empty())
+            SaveDialog::HostCreateNew(snapshot.generation);
+        else if (confirm && save_ui_index < count)
+            SaveDialog::HostSelect(snapshot.generation, save_ui_index);
+        if (cancel) SaveDialog::HostCancel(snapshot.generation);
+        focus_pending = false;
+        ImGui::End();
+    }
 
 	void DrawDialog(const SystemDialog::HostSnapshot& snapshot, vk::Extent2D extent) {
 		const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
@@ -1838,7 +1930,9 @@ struct SystemOverlay::Impl {
 		if (has_overlay && snapshot.session == prepared_session) {
 			if (snapshot.session.kind == OverlayKind::Dialog) {
 				DrawDialog(snapshot.dialog, frame_extent);
-			} else {
+			} else if (snapshot.session.kind == OverlayKind::SaveData) {
+                DrawSaveData(snapshot.save, frame_extent);
+            } else {
 				DrawIme(snapshot.ime, frame_extent);
 			}
 		}
